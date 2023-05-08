@@ -19,3 +19,9 @@ pkg/
 /tmp/
 /yarn-error.log
 /test-reports/
+
+# Devenv
+.devenv*
+.direnv
+devenv.local.nix
+
