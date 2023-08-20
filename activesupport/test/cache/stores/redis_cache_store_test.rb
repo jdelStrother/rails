@@ -78,7 +78,7 @@ module ActiveSupport::Cache::RedisCacheStoreTests
       end
     end
 
-    test "multiple URLs uses Redis::Distributed client" do
+    test "multiple URLs uses ShardedRedis client" do
       default_args = {
         connect_timeout: 1,
         read_timeout: 1,
@@ -91,7 +91,7 @@ module ActiveSupport::Cache::RedisCacheStoreTests
 
       Redis.stub(:new, mock) do
         @cache = build url: REDIS_URLS
-        assert_kind_of ::Redis::Distributed, @cache.redis
+        assert_kind_of ActiveSupport::Cache::RedisCacheStore::ShardedRedis, @cache.redis
       end
 
       assert_mock(mock)

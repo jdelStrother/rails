@@ -34,6 +34,104 @@ module ActiveSupport
     #   4.0.1+ for distributed mget support.
     # * +delete_matched+ support for Redis KEYS globs.
     class RedisCacheStore < Store
+      class ShardedRedis
+        def initialize(node_configs)
+          @ring = Redis::HashRing.new
+          node_configs.each do |config|
+            @ring.add_node Redis.new(config)
+          end
+        end
+
+        def node_for(key)
+          # XXX skip support for key-tags?
+          @ring.get_node(key)
+        end
+
+        def nodes
+          @ring.nodes
+        end
+
+        def on_each_node(command, *args)
+          nodes.map do |node|
+            node.send(command, *args)
+          end
+        end
+
+        def then
+          yield self
+        end
+
+        def flushdb
+          on_each_node :flushdb
+        end
+
+        def info(*args)
+          on_each_node :info, *args
+        end
+
+        def get(key)
+          node_for(key).get(key)
+        end
+
+        def set(key, value, **options)
+          node_for(key).set(key, value, **options)
+        end
+
+        def del(*keys)
+          keys.flatten!(1)
+          keys.group_by { |k| node_for(k) }.sum(0) do |node, subkeys|
+            node.del(*subkeys)
+          end
+        end
+
+        def mget(*keys)
+          result = keys.to_h { |k| [k, nil] }
+          keys.group_by { |k| node_for(k) }.map do |node, subkeys|
+            result.merge!(subkeys.zip(node.mget(subkeys)).to_h)
+          end
+          result.values
+        end
+
+        def incrby(key, amount)
+          node_for(key).incrby(amount)
+        end
+
+        def call(command, key, *args, **kwargs)
+          node_for(key).call(command, key, *args, **kwargs)
+        end
+
+        def expire(key, ttl)
+          node_for(key).expire(key, ttl)
+        end
+
+        # XXX: only used by tests
+        def ttl(key)
+          node_for(key).ttl(key)
+        end
+
+        # XXX: only used by tests
+        def exists?(key)
+          node_for(key).exists?(key)
+        end
+
+        # XXX: only used by tests
+        def setex(key, *args)
+          node_for(key).setex(key, *args)
+        end
+
+        def group_args_by_node(args)
+          nodes = args.each_slice(2).group_by { |k, _v| node_for(k) }
+          nodes.each do |node, grouped_args|
+            yield node, grouped_args.flatten
+          end
+        end
+
+        def group_hash_by_node(hash, &block)
+          nodes = hash.group_by { |k, _v| node_for(k) }
+          nodes.each(&block)
+        end
+      end
+
       # Keys are truncated with the ActiveSupport digest if they exceed 1kB
       MAX_KEY_BYTESIZE = 1024
 
@@ -75,7 +173,7 @@ module ActiveSupport
         #   :redis  Proc    ->  options[:redis].call
         #   :redis  Object  ->  options[:redis]
         #   :url    String  ->  Redis.new(url: …)
-        #   :url    Array   ->  Redis::Distributed.new([{ url: … }, { url: … }, …])
+        #   :url    Array   ->  ShardedRedis.new([{ url: … }, { url: … }, …])
         #
         def build_redis(redis: nil, url: nil, **redis_options) # :nodoc:
           urls = Array(url)
@@ -95,9 +193,8 @@ module ActiveSupport
 
         private
           def build_redis_distributed_client(urls:, **redis_options)
-            ::Redis::Distributed.new([], DEFAULT_REDIS_OPTIONS.merge(redis_options)).tap do |dist|
-              urls.each { |u| dist.add_node url: u }
-            end
+            options = DEFAULT_REDIS_OPTIONS.merge(redis_options)
+            ShardedRedis.new(urls.map { |u| options.merge(url: u) })
           end
 
           def build_redis_client(**redis_options)
@@ -153,7 +250,7 @@ module ActiveSupport
 
         @max_key_bytesize = MAX_KEY_BYTESIZE
         @error_handler = error_handler
-        @supports_pipelining = true
+        @sharded_client = @redis.then { |c| c.is_a?(ShardedRedis) }
 
         super(universal_options)
       end
@@ -294,15 +391,16 @@ module ActiveSupport
       end
 
       private
-        def pipelined(&block)
-          if @supports_pipelining
-            redis.then { |c| c.pipelined(&block) }
+        def pipeline_entries(entries, &block)
+          if @sharded_client
+            redis.then { |c|
+              entries.group_by { |k, _v| c.node_for(k) }.each do |node, sub_entries|
+                node.pipelined { |pipe| yield(pipe, sub_entries) }
+              end
+            }
           else
-            redis.then(&block)
+            redis.then { |c| c.pipelined { |pipe| yield(pipe, entries) } }
           end
-        rescue Redis::Distributed::CannotDistribute
-          @supports_pipelining = false
-          retry
         end
 
         # Store provider interface:
@@ -387,10 +485,10 @@ module ActiveSupport
           return if entries.empty?
 
           failsafe :write_multi_entries do
-            pipelined do |pipeline|
+            pipeline_entries(entries) do |pipeline, sharded_entries|
               options = options.dup
               options[:pipeline] = pipeline
-              entries.each do |key, entry|
+              sharded_entries.each do |key, entry|
                 write_entry key, entry, **options
               end
             end
@@ -436,7 +534,7 @@ module ActiveSupport
 
         def change_counter(key, amount, options)
           redis.then do |c|
-            c = c.node_for(key) if c.is_a?(Redis::Distributed)
+            c = c.node_for(key) if c.respond_to?(:node_for)
 
             if options[:expires_in] && supports_expire_nx?
               c.pipelined do |pipeline|
